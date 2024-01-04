@@ -1,0 +1,526 @@
+---
+title: "SCN_Fungi_OH_Analysis"
+author: "Melanie Medina Lopez"
+date: "2023-10-25"
+output: html_document
+---
+
+Samples were processed with ITSxpress before further processing in this pipeline
+
+## Setup
+
+Loading libraries, setting WD, file path and sample list
+
+```{r}
+library(dada2); packageVersion("dada2") 
+library(ggplot2)
+library(gridExtra)
+```
+
+```{r}
+setwd("/fs/ess/PAS1548/4169_221122_OSU_ponce_2_P1/22_SCN_ITSxpress") 
+path <- ("/fs/ess/PAS1548/4169_221122_OSU_ponce_2_P1/22_SCN_ITSxpress")
+fn <- list.files(path, pattern="contig_list_trimmed.fq", full.names=TRUE, recursive=TRUE)
+basename(fn)
+```
+
+Dereplication, generate list of unique sequence read number 
+
+```{r}
+drp <- derepFastq(fn, verbose=FALSE)
+sam <- sapply(strsplit(basename(fn), "_"), `[`, 3)
+```
+
+```{r}
+nunq <- Vectorize(function(x) length(getUniques(x)))
+nread <- Vectorize(function(x) sum(getUniques(x)))
+data.frame(row.names=sam, Reads=nread(drp), Uniques=nunq(drp))
+```
+
+Determining read length 
+
+```{r}
+unq.seqlens <- function(x) {
+  rep(nchar(getSequences(x)), times=x$uniques)
+}
+lendf <- data.frame(Sample=rep(sam, times=nread(drp)), Length=unlist(lapply(drp, unq.seqlens)))
+
+```
+
+Read length distribution: most samples have the peak on the expected lenght of ~500bp 
+
+```{r}
+unique_samples = unique(lendf$Sample)
+plot_list = list() 
+idx = 1
+
+for(s in unique_samples) {
+  plot_list[[idx]] <- ggplot(data=subset(lendf, Sample == s), aes(x=Length)) +
+                      geom_histogram(bins=100) +
+                      facet_wrap(~Sample)
+  idx = idx + 1
+}
+
+marrangeGrob(plot_list, nrow=2, ncol=2)
+```
+
+
+Quality plots: nothing to worry about here, all samples tested have good quality 
+
+```{r}
+plotQualityProfile(fn[1:9])
+plotQualityProfile(fn[10:20])
+plotQualityProfile(fn[21:30])
+plotQualityProfile(fn[70:80])
+plotQualityProfile(fn[90:100])
+```
+
+
+Further filtering
+
+```{r}
+filt <- file.path("filtered", basename(sam)) 
+track <- filterAndTrim(fn, filt, maxEE=2, minLen=250, maxLen=800, minQ=20 ) 
+cbind(raw=out[,1], noprimers=out[,2], filtered=track[,2])
+```
+
+Quality after filtering  
+```{r}
+plotQualityProfile(filt[1:9])
+plotQualityProfile(filt[10:20])
+plotQualityProfile(filt[21:30])
+plotQualityProfile(filt[70:80])
+plotQualityProfile(filt[90:100])
+```
+
+
+Learn error rates 
+```{r}
+err <- learnErrors(filt, multi=TRUE, verbose=TRUE) # Probably the longest running part
+plotErrors(err, nominalQ=TRUE)
+```
+
+```{r}
+dd <- dada(filt, err, multi=TRUE, verbose=TRUE)
+dd
+```
+
+```{r}
+sta <- makeSequenceTable(dd)
+st <- removeBimeraDenovo(sta, minFoldParentOverAbundance=4.5, multi=TRUE, verbose=TRUE)
+```
+
+
+Accounting for reads removed throught the processing steps 
+
+```{r}
+getN <- function(x) sum(getUniques(x))
+track <- cbind(filt, sapply(dd, getN), rowSums(st))
+colnames(track) <- c("filtered", "denoised", "nonchim")
+rownames(track) <- sam
+head(track)
+track
+```
+
+
+
+Taxonomy assingment with UNITE database 
+
+```{r}
+filename.rds <- "22_19_SCN_taxonomy_ASV_70.rds"
+if(!file.exists(filename.rds)) {
+  tax <- assignTaxonomy(st, "/fs/scratch/PAS1548/TSF/UNITE/sh_general_release_dynamic_29.11.2022.fasta", multi=TRUE, verbose=TRUE)
+  saveRDS(tax, filename.rds)
+}
+```
+
+
+Load libraries for further analysis 
+
+```{r}
+library("decontam")
+library("phyloseq")
+library("ggplot2")
+library("scales")
+library("DESeq2")
+library("vegan")
+library("dplyr")
+library("microbiome")
+library("ggvenn")
+library("RColorBrewer")
+library("data.table")
+library("gtools")
+library("indicspecies")
+library("tidyr")
+library("reshape2")
+library("gplots")
+library("corrr")
+library("ggcorrplot")
+library("FactoMineR")
+library("factoextra")
+library("ggraph")
+library("ggrepel")
+library("NetCoMi")
+library("phyloseqGraphTest")
+library("igraph")
+library("ggnetwork")
+```
+
+
+Preping files for phyloseq
+
+```{r}
+asv_seqs <- colnames(st)
+asv_headers <- paste('>ASV', 1:ncol(st), sep = '_')
+asv_fasta <- c(rbind(asv_headers, asv_seqs))
+write(asv_fasta, file = file.path("/fs/ess/PAS1548/4169_221122_OSU_ponce_2_P1/22_SCN_ITSxpress", '22_19_ASVsurvey.fa'))
+```
+
+```{r}
+otus <- fread("/Users/methanie/Downloads/22_19_ASVsurvey.fa")
+mapping <- read.csv("/Users/methanie/Downloads/2021-19-SCN-survey-master-sheet.csv", header = T, row.names = 3, fill=TRUE, sep = ",", stringsAsFactors = T)
+taxonomy <- readRDS('//Users/methanie/Documents/Survey experiment/Data_for_Sandip/22_19_SCN_taxonomy.rds')
+```
+
+
+Split abundance into categorical values 
+
+```{r}
+mapping <- within(mapping, { Incidence <- "No data"
+Incidence [is.na(Eggs_100cc_soil)] <- "No data" 
+Incidence [Eggs_100cc_soil == 0] <- "Not detected"
+Incidence [Eggs_100cc_soil > 0 & Eggs_100cc_soil < 100] <- "Low" 
+Incidence [Eggs_100cc_soil > 100 & Eggs_100cc_soil <= 600] <- "Medium"
+Incidence [Eggs_100cc_soil > 600] <- "High"
+})
+
+mapping$Year <- as.factor(mapping$Year)
+```
+
+
+Build Phyloseq object
+```{r}
+o <- otu_table(st, taxa_are_rows=FALSE)
+s <- sample_data(mapping)
+t <- tax_table(taxonomy)
+phylo <- phyloseq(o,s,t) 
+phylo
+```
+
+Decontamination of samples 
+
+This step has only identified one possible contaminant after using a threshold of 0.5 likelihood instead of the standard 0.1 threshold. 
+```{r}
+sample_data(phylo)$is.neg <- sample_data(phylo)$Sample_type == "Control"
+contamdf.prev <- isContaminant(phylo, method="prevalence", neg="is.neg", threshold=0.5)
+table(contamdf.prev$contaminant)
+```
+
+
+Remove contaminant 
+
+```{r}
+phylo <- prune_taxa(!contamdf.prev$contaminant, phylo)
+phylo
+```
+
+Subset to samples with more than 100 fungal reads 
+
+```{r} 
+fungi <-subset_taxa( phylo, Kingdom=="k__Fungi" )
+fungis <- prune_samples(sample_sums(fungi)>=100, fungi)
+fungis
+```
+
+
+Assigning ASV_# for easier vizualisation 
+
+```{r}
+dna <- Biostrings::DNAStringSet(taxa_names(fungis))
+names(dna) <- taxa_names(fungis)
+
+fungis <- merge_phyloseq(fungis, dna)
+
+taxa_names(fungis) <- paste("ASV", 1:ntaxa(fungis), sep = "_")
+```
+
+
+PCA with samples from 2021 using edaphoclimatic factors 
+
+```{r}
+no.na.21.num <- fread("/Users/methanie/Downloads/fungis21_PCA.csv")
+numerical_data <- no.na.21.num[,6:19]
+data.pca <- prcomp(numerical_data, scale= TRUE, center= TRUE)
+summary(data.pca)
+data.pca$loadings[, 2:3]
+fviz_eig(data.pca, addlabels = TRUE)
+```
+
+```{r}
+fviz_pca_ind(data.pca, geom.ind = "point", pointshape = 21, 
+             pointsize = 2, 
+             fill.ind = no.na.21.num$Region,
+             col.ind = "black", 
+             palette = "jco", 
+             addEllipses = TRUE,
+             ellipse.type = "convex",
+             label = "var",
+             col.var = "black",
+             repel = TRUE,
+             legend.title = "Region")
+```
+
+
+K-nearest neighbour analysis 
+```{r}
+gt <- graph_perm_test(fungis.net, "Region", grouping = "Sample_ID",
+                      distance = "jaccard", type = "knn", knn = 2)
+gt$pval
+
+plotNet=plot_test_network(gt)
+plotPerm2=plot_permutations(gt)
+
+plotNet
+plotPerm2
+```
+
+
+Get abundance relative abundance from phyloseq 
+```{r}
+indiphyseq <- transform_sample_counts(fungis, function(x) x / sum(x) )
+OTU1 = as(otu_table(indiphyseq), "matrix")
+if(taxa_are_rows(indiphyseq)){OTU1 <- t(OTU1)}
+indidf = as.data.frame(OTU1)
+write.csv(indidf, "/Users/methanie/Downloads/indiASVtab.csv")
+```
+
+Prep abundance table for indicator species analysis 
+```{r}
+ASVtab <- fread("/Users/methanie/Downloads/indiASVtab.csv")
+ASVtab <-subset(ASVtab, Incidence != "No data")
+abund = ASVtab[,2:9388]
+incidence = ASVtab$Incidence
+```
+
+Indicator species analysis 
+```{r}
+inv = multipatt(abund, incidence, func = "r.g", control = how(nperm=9999))
+```
+
+Subset for indicator species with P<= 0.05 
+
+```{r}
+summary(inv)
+inv.sign <- as.data.frame(inv$sign)
+ind.sign.05 <- subset(inv.sign, p.value <= .05)
+asv.list <- as.list(row.names(ind.sign.05))
+indsp_subset <- subset_taxa(fungis, rownames(tax_table(fungis)) %in% asv.list)
+```
+
+
+PCA with indicator species 
+```{r}
+indsp_subset %>%
+ tax_transform(rank = "unique", trans = "compositional") %>%
+ ord_calc(
+  method = "auto"
+ ) %>% 
+ ord_plot(
+  axes = c(1, 2), plot_taxa = 1:4,
+  colour = "Incidence", fill = "Incidence",
+  shape = "Region", alpha = 0.5,
+  size = 2
+ ) + 
+ scale_shape_girafe_filled() +
+ ggplot2::stat_ellipse(
+  ggplot2::aes(colour = Incidence)
+ )
+```
+
+Core community analysis 
+
+```{r}
+pseq.rel <- microbiome::transform(fungis, "compositional")
+Incidence.cat <- unique(as.character(meta(pseq.rel)$Incidence))
+list_core <- c() # an empty object to store information
+
+for (n in Incidence.cat){
+    
+    ps.sub <- subset_samples(pseq.rel, Incidence == n) 
+    
+    core_m <- core_members(ps.sub,  
+                           detection = 0.001, # 0.001 in atleast 90% samples 
+                           prevalence = 0.75)
+    print(paste0("No. of core taxa in ", n, " : ", length(core_m)))
+    list_core[[n]] <- core_m 
+    
+}
+
+list_core
+```
+
+Venn diagram for core community 
+
+```{r}
+mycols <- c(Medium="#d6e2e9", Low="#cbf3f0", Not.detected="#fcf5c7", High="#d8A0db" ) 
+venn <- plot(venn(list_core),
+     fills = mycols)
+venn
+```
+
+DESeq2 analysis 
+
+```{r}
+ds <- subset_samples(fungis, Incidence != "No data")
+ds <- transform_sample_counts(ds, function(x) x + 1 )
+dsd <- phyloseq_to_deseq2(ds, ~ Incidence)
+```
+
+```{r}
+dsdan = DESeq(dsd)
+resLvH <- results(dsdan, contrast= c("Incidence","Low","High"))
+resLvM<- results(dsdan, contrast= c("Incidence","Low","Medium"))
+resLvN <- results(dsdan, contrast= c("Incidence","Low","Not.detected"))
+
+resLvH05 <- results(dsdan, contrast= c("Incidence","Low","High"), alpha=0.05)
+summary(resLvH05)
+resLvM05<- results(dsdan, contrast= c("Incidence","Low","Medium"), alpha=0.05)
+summary(resLvM05)
+resLvN05 <- results(dsdan, contrast= c("Incidence","Low","Not.detected"), alpha=0.05)
+summary(resLvN05)
+resMvL05 <- results(dsdan, contrast= c("Incidence","Medium","Low"), alpha=0.05)
+summary(resMvL05)
+resMvH05 <- results(dsdan, contrast= c("Incidence","Medium","High"), alpha=0.05)
+summary(resMvH05)
+resMvN05 <- results(dsdan, contrast= c("Incidence","Medium","Not.detected"), alpha=0.05)
+summary(resMvN05)
+resHvN05 <- results(dsdan, contrast= c("Incidence","High","Not.detected"), alpha=0.05)
+summary(resHvN05)
+```
+
+```{r}
+#filtering to only keep statistically significant changes over log2Fold changes 
+
+LvH05 <- filter(LvH, padj<=0.05, log2FoldChange<=-2 | log2FoldChange>=2)
+LvM05 <- filter(LvM, padj<=0.05, log2FoldChange<=-2 | log2FoldChange>=2)
+LvN05 <- filter(LvN, padj<=0.05, log2FoldChange<=-2 | log2FoldChange>=2)
+MvH05 <- filter(MvH, padj<=0.05, log2FoldChange<=-2 | log2FoldChange>=2)
+MvN05 <- filter(MvN, padj<=0.05, log2FoldChange<=-2 | log2FoldChange>=2)
+HvN05 <- filter(HvN, padj<=0.05, log2FoldChange<=-2 | log2FoldChange>=2)
+```
+
+
+Bar plots for significantly enriched taxa 
+
+```{r}
+
+LvH05.p<-ggplot(data=LvH05, aes(x=LvH05$Tax, y=log2FoldChange, fill= log2FoldChange)) +
+  geom_bar(stat="identity")
+LvH05.p + coord_flip()
+
+LvM05.p<-ggplot(data=LvM05, aes(x=LvM05$Tax, y=log2FoldChange, fill= log2FoldChange)) +
+  geom_bar(stat="identity")
+LvM05.p + coord_flip()
+
+LvN05.p<-ggplot(data=LvN05, aes(x=LvN05$Tax, y=log2FoldChange, fill= log2FoldChange)) +
+  geom_bar(stat="identity")
+LvN05.p + coord_flip()
+
+MvH05.p<-ggplot(data=MvH05, aes(x=MvH05$Tax, y=log2FoldChange, fill= log2FoldChange)) +
+  geom_bar(stat="identity")
+MvH05.p + coord_flip()
+
+MvN05.p<-ggplot(data=MvN05, aes(x=MvN05$Tax, y=log2FoldChange, fill= log2FoldChange)) +
+  geom_bar(stat="identity")
+MvN05.p + coord_flip()
+
+HvN05.p<-ggplot(data=HvN05, aes(x=HvN05$Tax, y=log2FoldChange, fill= log2FoldChange)) +
+  geom_bar(stat="identity")
+HvN05.p + coord_flip()
+```
+
+Network analysis data prep
+
+```{r}
+fungis_net <- phyloseq::subset_samples(fungis, Incidence != "No data")
+nem_yes <- phyloseq::subset_samples(fungis_net, Incidence != "Not detected")
+nem_no  <- phyloseq::subset_samples(fungis_net, Incidence == "Not detected")
+```
+
+
+Differential network analysis 
+
+```{r}
+
+#Construct network with the 250 taxa with the highest variability in samples with and without nematodes 
+
+net_nema_pears <- netConstruct(data = nem_yes, 
+                                 data2 = nem_no, 
+                                 filtTax = "highestVar",
+                                 filtTaxPar = list(highestVar = 250),
+                                 measure = "pearson", 
+                                 normMethod = "clr",
+                                 sparsMethod = "none", 
+                                 zeroMethod = "pseudo",
+                               dissFunc = "unsigned",
+                                 thresh = 0.4,
+                                 verbose = 3)
+
+#Calculate significant differences in associations between networks 
+
+
+diff_nem <- diffnet(net_nema_pears,
+                       diffMethod = "fisherTest", 
+                        alpha = 0.01)
+
+props_nem_pears <- netAnalyze(net_nema_pears, 
+                                 clustMethod = "cluster_fast_greedy",
+                                 weightDeg = TRUE,
+                                 normDeg = FALSE,
+                                 gcmHeat = TRUE)
+
+diff_net_comp <- netCompare(props_nem_pears, 
+           permTest = TRUE, 
+           verbose = TRUE,
+           seed = 123456)
+
+summary(diff_net_comp, 
+        groupNames = c("Detected", "Not detected"),
+        showCentr = c("degree", "between", "closeness"))
+
+diffmat_sums <- rowSums(diff_nem$diffAdjustMat)
+diff_asso_names <- names(diffmat_sums[diffmat_sums > 0])
+
+nclust_diff <- as.numeric(max(names(table(props_nem_pears$clustering$clust1))))
+```
+
+
+Plot networks 
+```{r}
+col_diff_net <- c(hcl.colors(8, palette = "viridis"))
+
+plot(props_nem_pears, 
+     nodeFilter = "names",
+     nodeFilterPar = diff_asso_names,
+     colorVec = col_diff_net,
+     highlightHubs = TRUE,
+     sameLayout = TRUE, 
+     layoutGroup = "union",
+     rmSingles = FALSE, 
+     nodeSize = "clr",
+     labelScale = TRUE,
+nodeTransp = 10, 
+     hubTransp = 10,
+     cexLabels = .8,
+     groupNames = c("Detected", "Not detected"),
+     hubBorderCol  = "black")
+
+legend(-0.3,-0.5, title = "estimated correlation:", legend = c("+","-"), 
+       col = c("#009900","red"), inset = 0.05, cex = 1, lty = .8, lwd = .8, 
+       bty = "n", horiz = TRUE)
+```
+
+
+
+
+
